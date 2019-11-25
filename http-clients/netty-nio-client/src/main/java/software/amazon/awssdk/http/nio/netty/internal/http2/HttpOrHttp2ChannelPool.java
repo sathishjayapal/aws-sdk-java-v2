@@ -132,7 +132,13 @@ public class HttpOrHttp2ChannelPool implements ChannelPool {
                 delegatePool.release(newChannel);
                 protocolImplPromise.setFailure(new IllegalStateException("Pool closed"));
             } else {
-                protocolImplPromise.setSuccess(configureProtocol(newChannel, protocol));
+                try {
+                    protocolImplPromise.setSuccess(configureProtocol(newChannel, protocol));
+                } catch (Exception e) {
+                    newChannel.close();
+                    delegatePool.release(newChannel);
+                    protocolImplPromise.setFailure(e);
+                }
             }
         });
     }
