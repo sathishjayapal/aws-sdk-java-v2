@@ -15,7 +15,6 @@
 
 package software.amazon.awssdk.http.nio.netty.internal.http2;
 
-import static software.amazon.awssdk.http.nio.netty.internal.ChannelAttributeKey.PING_TRACKER;
 import static software.amazon.awssdk.http.nio.netty.internal.utils.NettyUtils.doInEventLoop;
 import static software.amazon.awssdk.http.nio.netty.internal.utils.NettyUtils.warnIfNotInEventLoop;
 
@@ -27,10 +26,13 @@ import io.netty.handler.codec.http2.Http2StreamChannelBootstrap;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GenericFutureListener;
 import io.netty.util.concurrent.Promise;
+import io.netty.util.concurrent.ScheduledFuture;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import software.amazon.awssdk.annotations.SdkInternalApi;
@@ -46,18 +48,24 @@ public class MultiplexedChannelRecord {
 
     private final Channel connection;
     private final long maxConcurrencyPerConnection;
+    private final Long allowedIdleConnectionTimeMillis;
+
     private final AtomicLong availableChildChannels;
+    private volatile long lastReserveAttemptTimeMillis;
 
     // Only read or write in the connection.eventLoop()
     private final Map<ChannelId, Http2StreamChannel> childChannels = new HashMap<>();
+    private ScheduledFuture<?> scheduledIdleShutdown;
 
     // Only write in the connection.eventLoop()
     private volatile RecordState state = RecordState.OPEN;
 
-    MultiplexedChannelRecord(Channel connection, long maxConcurrencyPerConnection) {
+
+    MultiplexedChannelRecord(Channel connection, long maxConcurrencyPerConnection, Duration allowedIdleConnectionTime) {
         this.connection = connection;
         this.maxConcurrencyPerConnection = maxConcurrencyPerConnection;
         this.availableChildChannels = new AtomicLong(maxConcurrencyPerConnection);
+        this.allowedIdleConnectionTimeMillis = allowedIdleConnectionTime == null ? null : allowedIdleConnectionTime.toMillis();
     }
 
     boolean acquireStream(Promise<Channel> promise) {
@@ -87,6 +95,7 @@ public class MultiplexedChannelRecord {
                 }
 
                 Http2StreamChannel channel = future.getNow();
+                cancelIdleShutdown();
                 childChannels.put(channel.id(), channel);
                 promise.setSuccess(channel);
             });
@@ -170,8 +179,53 @@ public class MultiplexedChannelRecord {
         childChannel.close();
         doInEventLoop(connection.eventLoop(), () -> {
             childChannels.remove(childChannel.id());
+            if (childChannels.isEmpty()) {
+                scheduleIdleShutdown();
+            }
             releaseClaim();
         });
+    }
+
+    private void cancelIdleShutdown() {
+        warnIfNotInEventLoop(connection.eventLoop());
+
+        if (scheduledIdleShutdown != null) {
+            scheduledIdleShutdown.cancel(false);
+            scheduledIdleShutdown = null;
+        }
+    }
+
+    private void scheduleIdleShutdown() {
+        warnIfNotInEventLoop(connection.eventLoop());
+
+        if (scheduledIdleShutdown != null || allowedIdleConnectionTimeMillis == null) {
+            return;
+        }
+
+        scheduledIdleShutdown = connection.eventLoop().schedule(() -> {
+            // If we've been closed, don't bother shutting down now.
+            if (state != RecordState.OPEN) {
+                return;
+            }
+
+            // Make sure there have been no reserves attempted since this task was scheduled.
+            if (lastReserveAttemptTimeMillis > System.currentTimeMillis() - allowedIdleConnectionTimeMillis) {
+                return;
+            }
+
+            // Cut off new streams from being acquired from this connection by setting the number of available channels to 0.
+            // This write may fail if a reservation has happened since we checked the lastReserveAttemptTime.
+            if (!availableChildChannels.compareAndSet(maxConcurrencyPerConnection, 0)) {
+                return;
+            }
+
+            // Mark ourselves as closed
+            state = RecordState.CLOSED;
+
+            // Start the shutdown process by closing the connection (which should be noticed by the connection pool)
+            connection.close();
+
+        }, allowedIdleConnectionTimeMillis, TimeUnit.MILLISECONDS);
     }
 
     public Channel getConnection() {
@@ -179,8 +233,9 @@ public class MultiplexedChannelRecord {
     }
 
     public boolean claimStream() {
+        lastReserveAttemptTimeMillis = System.currentTimeMillis();
         for (int attempt = 0; attempt < 5; ++attempt) {
-            if (state != RecordState.OPEN || pingInFlight()) {
+            if (state != RecordState.OPEN) {
                 return false;
             }
 
@@ -195,10 +250,6 @@ public class MultiplexedChannelRecord {
         }
 
         return false;
-    }
-
-    private boolean pingInFlight() {
-        return connection.attr(PING_TRACKER).get() != null;
     }
 
     boolean canBeClosedAndReleased() {

@@ -16,6 +16,7 @@
 package software.amazon.awssdk.http.nio.netty.internal.http2;
 
 import static software.amazon.awssdk.http.nio.netty.internal.ChannelAttributeKey.PROTOCOL_FUTURE;
+import static software.amazon.awssdk.http.nio.netty.internal.NettyConfiguration.HTTP2_CONNECTION_PING_TIMEOUT_SECONDS;
 import static software.amazon.awssdk.http.nio.netty.internal.utils.NettyUtils.doInEventLoop;
 
 import io.netty.channel.Channel;
@@ -25,6 +26,7 @@ import io.netty.channel.pool.ChannelPool;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GenericFutureListener;
 import io.netty.util.concurrent.Promise;
+import java.time.Duration;
 import software.amazon.awssdk.annotations.SdkInternalApi;
 import software.amazon.awssdk.http.Protocol;
 import software.amazon.awssdk.http.nio.netty.internal.NettyConfiguration;
@@ -150,7 +152,13 @@ public class HttpOrHttp2ChannelPool implements ChannelPool {
                                                  .maxPendingAcquires(configuration.maxPendingConnectionAcquires())
                                                  .build();
         } else {
-            ChannelPool h2Pool = new Http2MultiplexedChannelPool(delegatePool, eventLoopGroup);
+            Duration pingTimeout = Duration.ofSeconds(HTTP2_CONNECTION_PING_TIMEOUT_SECONDS);
+            ChannelPool pingedH2Pool = new Http2PingedChannelPool(delegatePool, ch -> new Http2ChannelHealthChecker(ch,
+                                                                                                                    pingTimeout));
+
+            Duration idleConnectionTimeout = configuration.reapIdleConnections()
+                                             ? Duration.ofMillis(configuration.idleTimeoutMillis()) : null;
+            ChannelPool h2Pool = new Http2MultiplexedChannelPool(pingedH2Pool, eventLoopGroup, idleConnectionTimeout);
             protocolImpl = BetterFixedChannelPool.builder()
                                                  .channelPool(h2Pool)
                                                  .executor(eventLoop)
